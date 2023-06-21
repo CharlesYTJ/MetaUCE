@@ -2,4 +2,6 @@
 
 - `Jun 21, 2023`: 🚀 model is released！
 
-## Due to our MetaUCE being under review, we will release other scripts once it is approved.
+
+
+## Due to our MetaUCE being under review, we will release other scripts after the publication of our paper.
