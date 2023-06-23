@@ -499,7 +499,7 @@ class MetaUCE(nn.Module):
         in_chans (int): Number of input image channels. Default: 3
         out_chans (int): Number of output channels. Default: 3
         embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin Transformer layer.
+        depths (tuple(int)): Depth of each block layer.
         num_heads (tuple(int)): Number of attention heads in different layers.
         window_size (int): Window size. Default: 7
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
