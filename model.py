@@ -19,7 +19,7 @@ class PatchMerging(nn.Module):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)  # 输入C为4*dim, 输出为2*dim
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -55,7 +55,7 @@ class PatchMerging(nn.Module):
         return flops
 
 
-class PatchExtension(nn.Module):
+class PatchExpand(nn.Module):
     def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
@@ -80,7 +80,7 @@ class PatchExtension(nn.Module):
         return x
 
 
-class FinalPatchExtension_X4(nn.Module):
+class FinalPatchExpand_X4(nn.Module):
     def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
@@ -180,14 +180,46 @@ class StarReLU(nn.Module):
             requires_grad=scale_learnable)
         self.bias = nn.Parameter(bias_value * torch.ones(1),
             requires_grad=bias_learnable)
-
     def forward(self, x):
         return self.scale * self.relu(x)**2 + self.bias
 
 
-class CFRM(nn.Module):
-    """ CFRM (channel feature reassignment modulator)
-    x: B, H*W, C
+class poolc(nn.Module):
+
+    def __init__(self, k=3):
+        super(poolc, self).__init__()
+        self.pool = nn.MaxPool1d(kernel_size=k, stride=3)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.pool(x)
+        x = x.permute(0, 2, 1)
+        return x
+
+
+# class dynamic_photon_search(nn.Module):
+#     """ CRN (channel Response Normalization) layer
+#     """
+#
+#     def __init__(self, dim):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(1, 1, dim)*1e-5)
+#         self.bias = nn.Parameter(torch.zeros(1, 1, dim))
+#         self.pool = poolc()
+#
+#     def forward(self, x):
+#         # B, L, C
+#         y = self.pool(x)
+#         # print('y', y.size())
+#         Gx = torch.norm(y, p=2, dim=1, keepdim=True)
+#         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
+#         # print('Nx', Nx.size())
+#         # return self.gamma * (x * Nx) + self.beta + x
+#         return x + Nx*self.weight + self.bias
+
+
+class CRN(nn.Module):
+    """ CRN (channel Response Normalization) layer
     """
 
     def __init__(self, dim):
@@ -196,16 +228,16 @@ class CFRM(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, 1, dim))
 
     def forward(self, x):
-        T = torch.norm(x, p=2, dim=-1, keepdim=True)
-        Nx = T / (T.mean(dim=1, keepdim=True) + 1e-6)
+        Gx = torch.norm(x, p=2, dim=-1, keepdim=True)
+        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
 
 
-class BSL(nn.Module):
+class new_SPP(nn.Module):
     def __init__(self, dim, k=5):
-        super(BSL, self).__init__()
+        super(new_SPP, self).__init__()
 
-        self.cfrm = CFRM(dim)
+        self.crn = CRN(dim)
         self.m = nn.MaxPool1d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
@@ -215,12 +247,13 @@ class BSL(nn.Module):
 
             x = x + self.m(x)
             x = x.permute(0, 2, 1)
-            x = self.cfrm(x)
+            x = self.crn(x)
             return x
 
 
-class LAMlp(nn.Module):
-    """ MLP as used in LAFormer models, eg Transformer, MLP-Mixer baslines and related networks.
+
+class MetaMlp(nn.Module):
+    """ MLP as used in MetaFormer models, eg Transformer, MLP-Mixer, PoolFormer, MetaFormer baslines and related networks.
     Mostly copied from timm.
     """
     def __init__(self, dim, mlp_ratio=4, out_features=None, act_layer=StarReLU, drop=0., bias=False, **kwargs):
@@ -273,8 +306,8 @@ class LayerNorm(nn.Module):
             return x
 
 
-class GFRM(nn.Module):
-    """ GFRM (Global Feature Reassignment Modulator) layer. Fine-tuning of CFRM for SeqNeXt.
+class GRN(nn.Module):
+    """ GRN (Global Response Normalization) layer
     """
 
     def __init__(self, dim):
@@ -283,13 +316,12 @@ class GFRM(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, 1, dim))
 
     def forward(self, x):
-        G = torch.norm(x, p=2, dim=1, keepdim=True)
-        Nx = G / (G.mean(dim=-1, keepdim=True) + 1e-6)
+        Gx = torch.norm(x, p=2, dim=1, keepdim=True)
+        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
 
-
-class SeqNeXtBlock(nn.Module):
-    """ SeqNeXt Block.
+class ConvNeXtV2Block(nn.Module):
+    """ ConvNeXtV2 Block.
 
     Args:
         dim (int): Number of input channels.
@@ -302,7 +334,7 @@ class SeqNeXtBlock(nn.Module):
         self.norm = LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
-        self.gfrm = GFRM(4 * dim)
+        self.grn = GRN(4 * dim)
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
@@ -311,22 +343,22 @@ class SeqNeXtBlock(nn.Module):
         input = x
         x = x.permute(0, 2, 1)
         x = self.dwconv(x)
-        x = x.permute(0, 2, 1)  # (N, C, L) -> (N, L, C), L=H*W
+        x = x.permute(0, 2, 1)  # (N, C, L) -> (N, L, C)
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
-        x = self.gfrm(x)
+        x = self.grn(x)
         x = self.pwconv2(x)
         x = input + self.drop_path(x)
         return x
 
 
-class LAFormerBlock(nn.Module):
+class MetaFormerBlock(nn.Module):
     """
-    Implementation of one LAFormer block.
+    Implementation of one MetaFormer block.
     """
     def __init__(self, dim,
-                 token_mixer=nn.Identity, mlp=LAMlp,
+                 token_mixer=nn.Identity, mlp=MetaMlp,
                  norm_layer=nn.LayerNorm,
                  drop=0., drop_path=0.,
                  layer_scale_init_value=None, res_scale_init_value=None
@@ -366,9 +398,91 @@ class LAFormerBlock(nn.Module):
             )
         return x
 
+# class MetaBasicLayer(nn.Module):
+#     """ A basic Swin Transformer layer for one stage.
+#     Args:
+#         dim (int): Number of input channels.
+#         input_resolution (tuple[int]): Input resolution.
+#         depth (int): Number of blocks.
+#         num_heads (int): Number of attention heads.
+#         window_size (int): Local window size.
+#         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+#         qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+#         qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+#         drop (float, optional): Dropout rate. Default: 0.0
+#         attn_drop (float, optional): Attention dropout rate. Default: 0.0
+#         drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+#         norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+#         downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+#         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+#     """
+#     def __init__(self, dim, depth, block2_depth, input_resolution, token_mixer=new_SPP, mlp=MetaMlp, Encoder_blocks=[MetaFormerBlock, ConvNeXtV2Block],
+#                     drop=0., drop_path=0., drop_path2=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+#
+#         super().__init__()
+#         self.dim = dim
+#         self.input_resolution = input_resolution
+#         self.depth = depth
+#         self.block2_depth = block2_depth
+#         self.use_checkpoint = use_checkpoint
+#
+#         # build blocks
+#         self.blocks = nn.ModuleList([
+#             Encoder_blocks[0](dim=dim,
+#                                  token_mixer=token_mixer,
+#                                  mlp=mlp,
+#                                  drop=drop,
+#                                  layer_scale_init_value=None,
+#                                  res_scale_init_value=None,
+#                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+#                                  norm_layer=norm_layer)
+#             for i in range(depth)])
+#
+#         self.blocks2 = nn.ModuleList([
+#             Encoder_blocks[1](dim=dim,
+#                   drop_path=drop_path2[i] if isinstance(drop_path2, list) else drop_path2)
+#             for i in range(block2_depth)])
+#
+#         # patch merging layer
+#         if downsample is not None:
+#             self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+#         else:
+#             self.downsample = None
+#
+#     def forward(self, x):
+#
+#         for blk in self.blocks:
+#             if self.use_checkpoint:
+#                 x1 = checkpoint.checkpoint(blk, x)
+#             else:
+#                 x1 = blk(x)
+#
+#         for blk in self.blocks2:
+#             if self.use_checkpoint:
+#                 x2 = checkpoint.checkpoint(blk, x)
+#             else:
+#                 x2 = blk(x)
+#         x = x2 + x1
+#         # print('x', x.size())
+#         if self.downsample is not None:
+#             x = self.downsample(x)
+#
+#         return x
+#
+#     def extra_repr(self) -> str:
+#         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
+#
+#     def flops(self):
+#         flops = 0
+#         for blk in self.blocks:
+#             flops += blk.flops()
+#         if self.downsample is not None:
+#             flops += self.downsample.flops()
+#         return flops
 
-class BasicLayer(nn.Module):
-    """ A basic layer for encoder.
+##########################################################################################
+class MetaBasicLayer1(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resolution.
@@ -385,23 +499,35 @@ class BasicLayer(nn.Module):
         downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
-    def __init__(self, dim, depth, input_resolution,
-                 blocks=[SeqNeXtBlock, SeqNeXtBlock, SeqNeXtBlock, SeqNeXtBlock],
-                 numbers=4, drop=0., drop_path=0., drop_path2=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+    def __init__(self, dim, depth, block2_depth, input_resolution, token_mixer=new_SPP, mlp=MetaMlp,
+                 # fetus_blocks_a=[MetaFormerBlock, MetaFormerBlock, MetaFormerBlock, MetaFormerBlock],
+                 fetus_blocks_b=[ConvNeXtV2Block, ConvNeXtV2Block, ConvNeXtV2Block, ConvNeXtV2Block],
+                 twins_layer_number=4, drop=0., drop_path=0., drop_path2=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
+        self.block2_depth = block2_depth
         self.use_checkpoint = use_checkpoint
-        self.drop = drop
-        self.drop_path = drop_path
 
-        for number in range(numbers):
-            self.blocks = nn.ModuleList([
-                blocks[number](dim=dim,
+        # build blocks
+        #for number in range(twins_layer_number):
+            #self.blocks = nn.ModuleList([
+                #fetus_blocks_a[number](dim=dim,
+                                     #token_mixer=token_mixer,
+                                     #mlp=mlp,
+                                     #drop=drop,
+                                     #layer_scale_init_value=None,
+                                     #res_scale_init_value=None,
+                                     #drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                     #norm_layer=norm_layer)
+                #for i in range(depth)])
+        for number in range(twins_layer_number):
+            self.blocks2 = nn.ModuleList([
+                fetus_blocks_b[number](dim=dim,
                       drop_path=drop_path2[i] if isinstance(drop_path2, list) else drop_path2)
-                for i in range(depth)])
+                for i in range(block2_depth)])
 
         # patch merging layer
         if downsample is not None:
@@ -411,16 +537,29 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
 
-        for blk in self.blocks:
+        #for blk in self.blocks:
+            #if self.use_checkpoint:
+                #x1 = checkpoint.checkpoint(blk, x)
+            #else:
+                #x1 = blk(x)
+
+        #if self.downsample is not None:
+            #x1 = self.downsample(x1)
+
+        for blk in self.blocks2:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x2 = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x)
-
+                x2 = blk(x)
+        #
         if self.downsample is not None:
-            x = self.downsample(x)
+            x2 = self.downsample(x2)
 
-        return x
+        # x = x1 + x2
+        # print('x', x.size())
+        # if self.downsample is not None:
+            # x = self.downsample(x)
+        return x2
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
@@ -434,8 +573,100 @@ class BasicLayer(nn.Module):
         return flops
 
 
-class BasicLayer_up(nn.Module):
-    """ A basic layer for decoder.
+class MetaBasicLayer2(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+    def __init__(self, dim, depth, block2_depth, input_resolution, token_mixer=new_SPP, mlp=MetaMlp,
+                 fetus_blocks_a=[MetaFormerBlock, MetaFormerBlock, MetaFormerBlock, MetaFormerBlock],
+                 fetus_blocks_b=[ConvNeXtV2Block, ConvNeXtV2Block, ConvNeXtV2Block, ConvNeXtV2Block],
+                 twins_layer_number=4, drop=0., drop_path=0., drop_path2=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.block2_depth = block2_depth
+        self.use_checkpoint = use_checkpoint
+
+        # build blocks
+        for number in range(twins_layer_number):
+            self.blocks = nn.ModuleList([
+                fetus_blocks_a[number](dim=dim,
+                                     token_mixer=token_mixer,
+                                     mlp=mlp,
+                                     drop=drop,
+                                     layer_scale_init_value=None,
+                                     res_scale_init_value=None,
+                                     drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                     norm_layer=norm_layer)
+                for i in range(depth)])
+        for number in range(twins_layer_number):
+            self.blocks2 = nn.ModuleList([
+                fetus_blocks_b[number](dim=dim,
+                      drop_path=drop_path2[i] if isinstance(drop_path2, list) else drop_path2)
+                for i in range(block2_depth)])
+
+        # patch merging layer
+        if downsample is not None:
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x):
+
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x1 = checkpoint.checkpoint(blk, x)
+            else:
+                x1 = blk(x)
+
+        if self.downsample is not None:
+            x1 = self.downsample(x1)
+
+        for blk in self.blocks2:
+            if self.use_checkpoint:
+                x2 = checkpoint.checkpoint(blk, x)
+            else:
+                x2 = blk(x)
+
+        if self.downsample is not None:
+            x2 = self.downsample(x2)
+
+        x = x1 + x2
+        # print('x', x.size())
+        # if self.downsample is not None:
+            # x = self.downsample(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
+
+    def flops(self):
+        flops = 0
+        for blk in self.blocks:
+            flops += blk.flops()
+        if self.downsample is not None:
+            flops += self.downsample.flops()
+        return flops
+###########################################################################################
+
+class MetaBasicLayer_up(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resolution.
@@ -453,8 +684,8 @@ class BasicLayer_up(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
-    def __init__(self,  dim, depth, input_resolution, token_mixer=BSL, mlp=LAMlp,
-                 drop=0., drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
+    def __init__(self,  dim, depth, input_resolution,token_mixer=new_SPP, mlp=MetaMlp,
+                 drop=0.,drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
@@ -464,7 +695,7 @@ class BasicLayer_up(nn.Module):
 
         # build blocks
         self.blocks = nn.ModuleList([
-            LAFormerBlock(dim=dim,
+            MetaFormerBlock(dim=dim,
                                  token_mixer=token_mixer,
                                  mlp=mlp,
                                  drop=drop, 
@@ -476,7 +707,7 @@ class BasicLayer_up(nn.Module):
 
         # patch merging layer
         if upsample is not None:
-            self.upsample = PatchExtension(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
+            self.upsample = PatchExpand(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
         else:
             self.upsample = None
 
@@ -491,15 +722,43 @@ class BasicLayer_up(nn.Module):
         return x
 
 
+class PatchExpand_two(nn.Module):
+    def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.expand = nn.Linear(dim, 2*dim, bias=False) if dim_scale==2 else nn.Identity()
+        self.norm = norm_layer(dim // dim_scale)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        x = self.expand(x)
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        x = x.view(B, H, W, C)
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=2, c=C//4)
+        x = x.view(B,-1,C//4)
+        x = self.norm(x)
+
+        return x
+
+
+##########################################################################
 class MetaUCE(nn.Module):
-    """
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
     Args:
         img_size (int | tuple(int)): Input image size. Default 224
         patch_size (int | tuple(int)): Patch size. Default: 4
         in_chans (int): Number of input image channels. Default: 3
-        out_chans (int): Number of output channels. Default: 3
+        out_chans (int): Number of classes for classification head. Default: 1000
         embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each block layer.
+        depths (tuple(int)): Depth of each Swin Transformer layer.
         num_heads (tuple(int)): Number of attention heads in different layers.
         window_size (int): Window size. Default: 7
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
@@ -514,10 +773,12 @@ class MetaUCE(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
 
+    # 修改前drop_path_rate=0.1
     def __init__(self, img_size=224, patch_size=4, in_chans=3, out_chans=3,
                  embed_dim=96,
-                 blocks_number=[3, 3, 9, 3],
-                 depths=[3, 3, 9, 3],
+                 fetus_blocks_number=[3, 3, 9, 3],
+                 depths=[3, 3, 9, 3], block2_depths=[3, 3, 9, 3], depths_decoder=[1, 2, 2, 2],
+                 single_layer=True,
                  mlp_ratio=4.,
                  drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -525,8 +786,9 @@ class MetaUCE(nn.Module):
         super().__init__()
 
         print(
-            "MetaUCE expand initial----depths_encoder:{};depths_decoder:{};drop_path_rate:{};out_chans:{}".format(
-                blocks_number, blocks_number, drop_path_rate, out_chans))
+            "MetaformerSys expand initial----Encoder1_depths:{};Encoder2_depths:{};depths_decoder:{};drop_path_rate:{};out_chans:{}".format(
+                depths, block2_depths,
+                depths_decoder, drop_path_rate, out_chans))
         
         self.out_chans = out_chans
         self.num_layers = len(depths)
@@ -555,69 +817,137 @@ class MetaUCE(nn.Module):
 
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+########################################################################################
+        if single_layer:
+            # build encoder and bottleneck layers
+            self.layers = nn.ModuleList()
+            for i_layer in range(self.num_layers):
+                layer = MetaBasicLayer1(dim=int(embed_dim * 2 ** i_layer),
+                                        depth=fetus_blocks_number[i_layer],
+                                        block2_depth=block2_depths[i_layer],
+                                        input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                          patches_resolution[1] // (2 ** i_layer)),
+                                        drop=drop_rate,
+                                        drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                        norm_layer=norm_layer,
+                                        downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                                        use_checkpoint=use_checkpoint)
+                self.layers.append(layer)
 
-        # build encoder and bottleneck layers
-        self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                                    depth=blocks_number[i_layer],
-                                    input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                                        patches_resolution[1] // (2 ** i_layer)),
-                                    drop=drop_rate,
-                                    drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                                    norm_layer=norm_layer,
-                                    downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                                    use_checkpoint=use_checkpoint)
-            self.layers.append(layer)
+            numbers = [1, 2]
+            self.add_layer = nn.ModuleList()
+            self.crn = nn.ModuleList()
+            for add in numbers:
+                add_up = PatchExpand_two(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - add)),
+                                                           patches_resolution[1] // (2 ** (self.num_layers - 1 - add))),
+                                         dim=2 * int(embed_dim * 2 ** (self.num_layers - 1 - add)), dim_scale=2,
+                                         norm_layer=norm_layer)
+                crn = CRN(dim=int(embed_dim * 2 ** (self.num_layers - 1 - add)))
+                self.crn.append(crn)
+                self.add_layer.append(add_up)
 
-        numbers = [1, 2]
-        self.add_layer = nn.ModuleList()
-        self.cfrm = nn.ModuleList()
-        for add in numbers:
-            add_up = PatchExtension(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - add)),
-                                                        patches_resolution[1] // (2 ** (self.num_layers - 1 - add))),
-                                    dim=2 * int(embed_dim * 2 ** (self.num_layers - 1 - add)), dim_scale=2,
-                                    norm_layer=norm_layer)
-            cfrm = CFRM(dim=int(embed_dim * 2 ** (self.num_layers - 1 - add)))
-            self.cfrm.append(cfrm)
-            self.add_layer.append(add_up)
+            # build decoder layers
+            self.layers_up = nn.ModuleList()
+            self.concat_back_dim = nn.ModuleList()
+            for i_layer in range(self.num_layers):
+                concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                          int(embed_dim * 2 ** (
+                                                  self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
+                if i_layer == 0:
+                    layer_up = PatchExpand(
+                        input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                                          patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                        dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
+                else:
+                    layer_up = MetaBasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                                 depth=depths[(self.num_layers - 1 - i_layer)],
+                                                 input_resolution=(
+                                                     patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                                                     patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                                                 drop=drop_rate,
+                                                 drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                                                     depths[:(self.num_layers - 1 - i_layer) + 1])],
+                                                 norm_layer=norm_layer,
+                                                 upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                                 use_checkpoint=use_checkpoint)
+                self.layers_up.append(layer_up)
+                self.concat_back_dim.append(concat_linear)
+        else:
+            # build encoder and bottleneck layers
+            self.layers = nn.ModuleList()
+            for i_layer in range(self.num_layers):
+                layer = MetaBasicLayer2(dim=int(embed_dim * 2 ** i_layer),
+                                       depth=fetus_blocks_number[i_layer],
+                                       block2_depth=block2_depths[i_layer],
+                                       input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                         patches_resolution[1] // (2 ** i_layer)),
+                                       drop=drop_rate,
+                                       drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                       norm_layer=norm_layer,
+                                       downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                                       use_checkpoint=use_checkpoint)
+                self.layers.append(layer)
 
-        # build decoder layers
-        self.layers_up = nn.ModuleList()
-        self.concat_back_dim = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
-                                        int(embed_dim * 2 ** (
-                                                self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
-            if i_layer == 0:
-                layer_up = PatchExtension(
-                    input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
-                                        patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
-                    dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
-            else:
-                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
-                                         depth=depths[(self.num_layers - 1 - i_layer)],
-                                         nput_resolution=(
+            numbers = [1, 2]
+            self.add_layer = nn.ModuleList()
+            self.crn = nn.ModuleList()
+            for add in numbers:
+                add_up = PatchExpand_two(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - add)),
+                                                           patches_resolution[1] // (2 ** (self.num_layers - 1 - add))),
+                                         dim=2 * int(embed_dim * 2 ** (self.num_layers - 1 - add)), dim_scale=2,
+                                         norm_layer=norm_layer)
+                crn = CRN(dim=int(embed_dim * 2 ** (self.num_layers - 1 - add)))
+                self.crn.append(crn)
+                self.add_layer.append(add_up)
+
+            # build decoder layers
+            self.layers_up = nn.ModuleList()
+            self.concat_back_dim = nn.ModuleList()
+            for i_layer in range(self.num_layers):
+                concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                          int(embed_dim * 2 ** (
+                                                      self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
+                if i_layer == 0:
+                    layer_up = PatchExpand(
+                        input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                                          patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                        dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
+                else:
+                    layer_up = MetaBasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                                 depth=depths[(self.num_layers - 1 - i_layer)],
+                                                 input_resolution=(
                                                  patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
                                                  patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
-                                         drop=drop_rate,
-                                         drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
-                                                 depths[:(self.num_layers - 1 - i_layer) + 1])],
-                                         norm_layer=norm_layer,
-                                         upsample=PatchExtension if (i_layer < self.num_layers - 1) else None,
-                                         use_checkpoint=use_checkpoint)
-            self.layers_up.append(layer_up)
-            self.concat_back_dim.append(concat_linear)
+                                                 drop=drop_rate,
+                                                 drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                                                     depths[:(self.num_layers - 1 - i_layer) + 1])],
+                                                 norm_layer=norm_layer,
+                                                 upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                                 use_checkpoint=use_checkpoint)
+                self.layers_up.append(layer_up)
+                self.concat_back_dim.append(concat_linear)
+#################################################################################################
 
         self.norm = norm_layer(self.num_features)
         self.norm_up = norm_layer(self.embed_dim)
 
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
-            self.up = FinalPatchExtension_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
-                                             dim_scale=4, dim=embed_dim)
+            self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
+                                          dim_scale=4, dim=embed_dim)
             self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.out_chans, kernel_size=1, bias=False)
-
+            self.dp = nn.Sequential(
+                #nn.AdaptiveMaxPool2d((1,1)),
+                nn.Conv2d(in_channels=3, out_channels=3, kernel_size=1,bias=True),
+                nn.Tanh()
+                
+            )
+            # self.dp = nn.Sequential(
+                # #nn.AdaptiveMaxPool2d((1,1)),
+                # nn.Conv2d(in_channels=3, out_channels=1, kernel_size=1,bias=True),
+                # nn.Tanh()
+                
+            # )
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -639,6 +969,7 @@ class MetaUCE(nn.Module):
 
     def forward_features(self, x):
 
+        # convnext_list = self.convnext(x)
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -651,25 +982,35 @@ class MetaUCE(nn.Module):
 
         x = self.norm(x)
 
+        # return x, x_downsample, convnext_list
         return x, x_downsample
 
     def forward_up_features(self, x, x_downsample):
+        # 不写为for循环
+        # print('x', x.size())
         x = self.layers_up[0](x)
+        # print('xx1', x.size())
         x1 = torch.cat([x, x_downsample[2]], -1)
         x = self.concat_back_dim[1](x1)
         x = self.layers_up[1](x)
+        # print('xx2', x.size())
         x2 = torch.cat([x, x_downsample[1]], -1)
+        # print('x1', x1.size())
         x1 = self.add_layer[0](x1)
-        x1 = self.cfrm[0](x1)
+        # print('x11', x1.size())
+        # print('x2', x1.size())
+        x1 = self.crn[0](x1)
         x = x2 + x1
         x = self.concat_back_dim[2](x)
         x = self.layers_up[2](x)
+        # print('xx3', x.size())
         x3 = torch.cat([x, x_downsample[0]], -1)
         x2 = self.add_layer[1](x2)
-        x2 = self.cfrm[1](x2)
+        x2 = self.crn[1](x2)
         x = x3 + x2
         x = self.concat_back_dim[3](x)
         x = self.layers_up[3](x)
+        # print('xx4', x.size())
         x = self.norm_up(x)
         return x
 
@@ -683,24 +1024,27 @@ class MetaUCE(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             x = self.output(x)
-
+            
         return x
 
     def forward(self, img):
         x, x_downsample = self.forward_features(img)
+        # print('已完成')
         x = self.forward_up_features(x, x_downsample)
         x = self.up_x4(x)
         x = torch.tanh(x)
+        imgd = self.dp(img)
+        r1, r2, r3 = torch.split(x+0.1*torch.log1p(imgd), 1, dim=1)
+        # r1, r2, r3 = torch.split(x, 1, dim=1)
+        img = img + r1 * (torch.pow(img, 2) - img)
+        img = img + r2 * (torch.pow(img, 2) - img)
+        img = img + r2 * (torch.pow(img, 2) - img)
+        enhance_image = img + r3 * (torch.pow(img, 2) - img)
 
-        D1, D2, D3 = torch.split(x, 1, dim=1)
-        img1 = img + D1 * (torch.pow(img, 2) - img)
-        img2 = img1 + D2 * (torch.pow(img1, 2) - img1)
-        enhance_image_1 = img2 + D2 * (torch.pow(img2, 2) - img2)
-        enhance_image = enhance_image_1 + D3 * (torch.pow(enhance_image_1, 2) - enhance_image_1)
+        r = torch.cat([r1, r2, r3], 1)
 
-        r = torch.cat([D1, D2, D3], 1)
-
-        return enhance_image_1, enhance_image, r
+        # return enhance_image, r, torch.log1p(imgd)
+        return enhance_image, r, torch.log1p(imgd)
 
     def flops(self):
         flops = 0
@@ -710,3 +1054,15 @@ class MetaUCE(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.out_chans
         return flops
+        
+def metauace3v(img_size=224):
+    model = MetaUCE(img_size=img_size, patch_size=4, in_chans=3, out_chans=3,
+                 embed_dim=32,
+                 blocks_number=[2, 2, 6, 2],
+                 depths=[1, 2, 3, 1],
+                 mlp_ratio=4.,
+                 drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
+                 use_checkpoint=False, final_upsample="expand_first",
+                 )
+    return model
